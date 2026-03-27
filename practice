@@ -1,0 +1,7 @@
+import webbrowser
+
+# LinkedIn login URL
+linkedin_login_url = "https://www.linkedin.com/login"
+
+# Open LinkedIn login page in the default browser
+webbrowser.open(linkedin_login_url)
