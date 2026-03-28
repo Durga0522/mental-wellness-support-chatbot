@@ -1,5 +1,2 @@
-flask
-flask_sqlalchemy
-flask_cors
-textblob
-openai
+fastapi
+uvicorn

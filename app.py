@@ -1,25 +1,22 @@
 # app.py
 """
-Single-file AI-Powered Mental Health Support Chatbot.
+Single-file AI-Powered Mental Wellness Support Chatbot
+Dynamic AI version using OpenAI Responses API
 
-- Backend: Flask + SQLite (SQLAlchemy)
-- Frontend: HTML + CSS + JS served by Flask
-- Charts: Chart.js (CDN)
-- NLP: TextBlob sentiment
-- Safety: crisis keyword detection, no medical diagnosis
+Run:
+1. pip install -r requirements.txt
+2. Set OPENAI_API_KEY
+3. python app.py
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify, render_template_string
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from textblob import TextBlob
-
-# ---------------------------------------------------------------------
-# Flask + DB setup
-# ---------------------------------------------------------------------
+from openai import OpenAI
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///mental_health_chatbot.db"
@@ -27,6 +24,11 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 CORS(app)
 db = SQLAlchemy(app)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
 
 # ---------------------------------------------------------------------
 # Models
@@ -74,8 +76,9 @@ class WellnessEntry(db.Model):
 with app.app_context():
     db.create_all()
 
+
 # ---------------------------------------------------------------------
-# Services: sentiment, suggestions, crisis detection
+# Helpers
 # ---------------------------------------------------------------------
 
 CRISIS_KEYWORDS = [
@@ -87,79 +90,182 @@ CRISIS_KEYWORDS = [
     "end my life",
     "self harm",
     "hurt myself",
+    "suicide",
 ]
+
+MOOD_SCORE_MAP = {
+    "sad": 2,
+    "anxious": 3,
+    "stressed": 4,
+    "neutral": 6,
+    "happy": 9,
+}
 
 
 def analyze_sentiment(text: str) -> float:
     if not text:
         return 0.0
-    blob = TextBlob(text)
-    return float(blob.sentiment.polarity)
+    return float(TextBlob(text).sentiment.polarity)
 
 
-def generate_suggestions(mood, stress_level, anxiety_level, sleep_hours, sentiment_score):
-    suggestions = []
-
-    if mood in ["sad", "anxious", "stressed"] or (sentiment_score is not None and sentiment_score < 0):
-        suggestions.append(
-            "It sounds like today may feel heavy. Try pausing for a moment and taking 3 slow deep breaths."
-        )
-        suggestions.append(
-            "If it helps, write a little more about what is bothering you so you can notice patterns in your thoughts."
-        )
-
-    if stress_level is not None and stress_level >= 7:
-        suggestions.append(
-            "Your stress level seems high. A short walk, a glass of water, or a 5-minute break may help reduce tension."
-        )
-
-    if anxiety_level is not None and anxiety_level >= 7:
-        suggestions.append(
-            "Anxiety can feel overwhelming. Try grounding yourself by noticing 5 things you can see and 4 things you can touch."
-        )
-
-    if sleep_hours is not None and sleep_hours < 6:
-        suggestions.append(
-            "Your sleep looks lower than ideal. A simple bedtime routine and reducing screen time before bed may support better rest."
-        )
-
-    if mood == "happy" and (stress_level is not None and stress_level <= 4):
-        suggestions.append(
-            "You seem to be doing relatively well today. Try to keep up the habits that are helping you feel balanced."
-        )
-
-    if not suggestions:
-        suggestions.append(
-            "Thank you for checking in today. Keep noticing how you feel and give yourself space to rest when needed."
-        )
-
-    suggestions.append(
-        "This chatbot offers emotional wellness support only and is not a substitute for professional mental health care."
-    )
-
-    return suggestions
+def sentiment_label(score: float) -> str:
+    if score > 0.2:
+        return "Positive"
+    if score < -0.2:
+        return "Negative"
+    return "Neutral"
 
 
 def detect_crisis(text: str) -> bool:
     if not text:
         return False
     lowered = text.lower()
-    return any(phrase in lowered for phrase in CRISIS_KEYWORDS)
+    return any(keyword in lowered for keyword in CRISIS_KEYWORDS)
 
 
 def crisis_response():
     return {
         "is_crisis": True,
         "message": (
-            "It sounds like you may be in immediate emotional distress. "
+            "⚠️ It sounds like you may be in immediate emotional distress.\n\n"
             "This chatbot cannot provide crisis support. Please contact emergency services, "
             "a crisis helpline, or a trusted person right away."
         ),
         "resources": [
-            "If you are in immediate danger, call your local emergency services now.",
-            "Reach out to a trusted friend, family member, or licensed mental health professional immediately.",
+            "Call your local emergency services if you are in immediate danger.",
+            "Reach out to a trusted friend, family member, or licensed mental health professional now.",
         ],
+        "created_at": datetime.utcnow().isoformat(),
     }
+
+
+def build_fallback_reply(mood, stress_level, anxiety_level, sleep_hours, sentiment_score):
+    detected = sentiment_label(sentiment_score)
+
+    if mood in ["sad", "anxious", "stressed"] or sentiment_score < 0:
+        text = (
+            "Thank you for sharing that with me. It sounds like today feels a bit heavy. "
+            "Try taking a small pause, drinking some water, and focusing on one gentle step at a time. "
+            "If you want, you can tell me what is bothering you most right now."
+        )
+    elif mood == "happy" or sentiment_score > 0.2:
+        text = (
+            "I am really glad to hear that. It sounds like something positive is part of your day. "
+            "Try to hold onto that feeling and notice what helped create it."
+        )
+    else:
+        text = (
+            "Thank you for checking in. I am here with you. "
+            "Try to slow down for a moment and notice what your mind and body need right now."
+        )
+
+    extra_parts = []
+
+    if stress_level is not None and stress_level >= 7:
+        extra_parts.append("Your stress level seems high, so a short break or a small walk may help.")
+    if anxiety_level is not None and anxiety_level >= 7:
+        extra_parts.append("Your anxiety looks elevated, so grounding yourself with your surroundings may help.")
+    if sleep_hours is not None and sleep_hours < 6:
+        extra_parts.append("You also mentioned lower sleep, which can make everything feel harder.")
+
+    if extra_parts:
+        text += " " + " ".join(extra_parts)
+
+    text += " This chatbot offers emotional wellness support only and is not a substitute for professional mental health care."
+    return text, detected
+
+
+def build_ai_prompt(message, mood, stress_level, anxiety_level, sleep_hours, detected_sentiment):
+    return f"""
+You are a supportive emotional wellness chatbot.
+
+Rules:
+- Be warm, empathetic, natural, and concise.
+- Respond specifically to the user's exact message.
+- Do not repeat the same generic response.
+- Mention mood/stress/anxiety/sleep details only if relevant.
+- Do not diagnose any condition.
+- Do not say you are a therapist.
+- Do not give dangerous or extreme advice.
+- If the user sounds happy, respond positively and naturally.
+- If the user sounds sad, stressed, lonely, anxious, or overwhelmed, respond gently and practically.
+- Ask at most one short follow-up question.
+- Keep the reply under 100 words.
+- Do not use bullet points.
+
+User data:
+Mood: {mood or "Not provided"}
+Stress level: {stress_level if stress_level is not None else "Not provided"}
+Anxiety level: {anxiety_level if anxiety_level is not None else "Not provided"}
+Sleep hours: {sleep_hours if sleep_hours is not None else "Not provided"}
+Detected sentiment: {detected_sentiment}
+
+User message:
+{message}
+""".strip()
+
+
+def generate_dynamic_ai_reply(message, mood, stress_level, anxiety_level, sleep_hours, sentiment_score):
+    detected = sentiment_label(sentiment_score)
+
+    if not client:
+        return build_fallback_reply(mood, stress_level, anxiety_level, sleep_hours, sentiment_score)
+
+    prompt = build_ai_prompt(
+        message=message,
+        mood=mood,
+        stress_level=stress_level,
+        anxiety_level=anxiety_level,
+        sleep_hours=sleep_hours,
+        detected_sentiment=detected,
+    )
+
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+        text = (response.output_text or "").strip()
+        if not text:
+            return build_fallback_reply(mood, stress_level, anxiety_level, sleep_hours, sentiment_score)
+        return text, detected
+    except Exception:
+        return build_fallback_reply(mood, stress_level, anxiety_level, sleep_hours, sentiment_score)
+
+
+def get_weekly_summary(entries):
+    if not entries:
+        return {
+            "average_stress": 0,
+            "average_sleep": 0,
+            "average_anxiety": 0,
+            "most_common_mood": "No data",
+            "checkins": 0,
+        }
+
+    stress_values = [e.stress_level for e in entries if e.stress_level is not None]
+    sleep_values = [e.sleep_hours for e in entries if e.sleep_hours is not None]
+    anxiety_values = [e.anxiety_level for e in entries if e.anxiety_level is not None]
+    moods = [e.mood for e in entries if e.mood]
+
+    def avg(values):
+        return round(sum(values) / len(values), 1) if values else 0
+
+    most_common_mood = "No data"
+    if moods:
+        mood_counts = {}
+        for mood in moods:
+            mood_counts[mood] = mood_counts.get(mood, 0) + 1
+        most_common_mood = max(mood_counts, key=mood_counts.get).title()
+
+    return {
+        "average_stress": avg(stress_values),
+        "average_sleep": avg(sleep_values),
+        "average_anxiety": avg(anxiety_values),
+        "most_common_mood": most_common_mood,
+        "checkins": len(entries),
+    }
+
 
 # ---------------------------------------------------------------------
 # API routes
@@ -167,7 +273,12 @@ def crisis_response():
 
 @app.route("/api/health")
 def health_check():
-    return {"status": "ok", "message": "Mental Health Chatbot API running"}
+    return {
+        "status": "ok",
+        "message": "Mental Health Chatbot API running",
+        "openai_configured": bool(client),
+        "model": OPENAI_MODEL,
+    }
 
 
 @app.route("/api/chat/message", methods=["POST"])
@@ -207,34 +318,55 @@ def handle_message():
     db.session.add(entry)
     db.session.commit()
 
-    suggestions = generate_suggestions(
-        mood, stress_level, anxiety_level, sleep_hours, sentiment_score
+    ai_reply, detected_sentiment = generate_dynamic_ai_reply(
+        message=message,
+        mood=mood,
+        stress_level=stress_level,
+        anxiety_level=anxiety_level,
+        sleep_hours=sleep_hours,
+        sentiment_score=sentiment_score,
     )
 
-    bot_reply = {
+    return jsonify({
         "is_crisis": False,
         "sentiment_score": sentiment_score,
-        "suggestions": suggestions,
-        "acknowledgement": "Thank you for sharing how you are feeling today. I am here to offer gentle support.",
+        "detected_sentiment": detected_sentiment,
+        "grouped_message": ai_reply,
         "created_at": datetime.utcnow().isoformat(),
-    }
-    return jsonify(bot_reply), 200
+    }), 200
 
 
 @app.route("/api/tracking/summary", methods=["GET"])
 def get_summary():
     username = request.args.get("username", "guest")
     user = User.query.filter_by(username=username).first()
+
     if not user:
-        return jsonify({"entries": []}), 200
+        return jsonify({
+            "entries": [],
+            "weekly_summary": {
+                "average_stress": 0,
+                "average_sleep": 0,
+                "average_anxiety": 0,
+                "most_common_mood": "No data",
+                "checkins": 0,
+            }
+        }), 200
 
     entries = (
         WellnessEntry.query.filter_by(user_id=user.id)
         .order_by(WellnessEntry.created_at.asc())
         .all()
     )
-    data = [e.to_dict() for e in entries]
-    return jsonify({"entries": data}), 200
+
+    one_week_ago = datetime.utcnow() - timedelta(days=7)
+    weekly_entries = [e for e in entries if e.created_at >= one_week_ago]
+
+    return jsonify({
+        "entries": [entry.to_dict() for entry in entries],
+        "weekly_summary": get_weekly_summary(weekly_entries),
+    }), 200
+
 
 # ---------------------------------------------------------------------
 # Frontend
@@ -264,6 +396,7 @@ INDEX_HTML = """
             --alert-bg: #fff1f1;
             --alert-border: #e45b5b;
             --input-bg: rgba(255, 255, 255, 0.92);
+            --summary-bg: rgba(255, 255, 255, 0.58);
         }
 
         * {
@@ -280,24 +413,24 @@ INDEX_HTML = """
         }
 
         .app-container {
-            max-width: 1250px;
+            max-width: 1280px;
             margin: 0 auto;
-            padding: 28px 18px 34px;
+            padding: 24px 16px 30px;
         }
 
         header {
             text-align: center;
-            margin-bottom: 24px;
+            margin-bottom: 18px;
         }
 
         header h1 {
-            font-size: 2.5rem;
+            font-size: 2.2rem;
             margin-bottom: 8px;
             font-weight: 700;
         }
 
         .subtitle {
-            font-size: 1rem;
+            font-size: 0.98rem;
             color: var(--text-muted);
             margin-bottom: 10px;
         }
@@ -305,20 +438,20 @@ INDEX_HTML = """
         .disclaimer {
             max-width: 760px;
             margin: 0 auto;
-            padding: 12px 16px;
+            padding: 10px 14px;
             background: rgba(255, 255, 255, 0.55);
             border: 1px solid rgba(255, 255, 255, 0.35);
             border-radius: 14px;
-            font-size: 0.96rem;
+            font-size: 0.9rem;
             color: #36485f;
             box-shadow: 0 6px 20px rgba(34, 48, 70, 0.06);
         }
 
         main {
             display: grid;
-            grid-template-columns: 1.9fr 1fr;
-            gap: 20px;
-            align-items: stretch;
+            grid-template-columns: 1.45fr 1fr;
+            gap: 18px;
+            align-items: start;
         }
 
         .chat-section,
@@ -328,24 +461,24 @@ INDEX_HTML = """
             border: 1px solid var(--border);
             border-radius: 22px;
             box-shadow: var(--shadow);
-            padding: 22px;
+            padding: 18px;
         }
 
         .section-title {
-            font-size: 1.35rem;
-            margin-bottom: 16px;
+            font-size: 1.25rem;
+            margin-bottom: 14px;
             font-weight: 700;
         }
 
         .user-info,
         .field-group {
-            margin-bottom: 14px;
+            margin-bottom: 12px;
         }
 
         label {
             display: block;
-            margin-bottom: 7px;
-            font-size: 0.96rem;
+            margin-bottom: 6px;
+            font-size: 0.92rem;
             font-weight: 600;
             color: var(--text-main);
         }
@@ -357,8 +490,8 @@ INDEX_HTML = """
             border: 1px solid #c9d5e4;
             background: var(--input-bg);
             border-radius: 12px;
-            padding: 12px 14px;
-            font-size: 0.98rem;
+            padding: 11px 13px;
+            font-size: 0.95rem;
             color: var(--text-main);
             outline: none;
             transition: border-color 0.2s ease, box-shadow 0.2s ease;
@@ -373,9 +506,9 @@ INDEX_HTML = """
 
         .wellness-grid {
             display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 14px;
-            margin-bottom: 18px;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 16px;
         }
 
         .full-width {
@@ -392,32 +525,32 @@ INDEX_HTML = """
         }
 
         .chat-subtitle {
-            font-size: 0.92rem;
+            font-size: 0.88rem;
             color: var(--text-muted);
         }
 
         .chat-window {
-            height: 340px;
+            height: 330px;
             overflow-y: auto;
             background: rgba(255, 255, 255, 0.62);
             border: 1px solid rgba(120, 149, 178, 0.18);
             border-radius: 18px;
-            padding: 16px;
-            margin-bottom: 14px;
+            padding: 14px;
+            margin-bottom: 12px;
         }
 
         .empty-chat {
             text-align: center;
             color: var(--text-muted);
-            font-size: 0.95rem;
-            padding: 40px 10px;
+            font-size: 0.9rem;
+            padding: 36px 10px;
         }
 
         .message {
-            margin-bottom: 14px;
+            margin-bottom: 12px;
             display: flex;
             flex-direction: column;
-            max-width: 82%;
+            max-width: 84%;
         }
 
         .message.user {
@@ -432,7 +565,7 @@ INDEX_HTML = """
         }
 
         .message-meta {
-            font-size: 0.78rem;
+            font-size: 0.76rem;
             color: var(--text-muted);
             margin-bottom: 4px;
             padding: 0 4px;
@@ -440,9 +573,9 @@ INDEX_HTML = """
 
         .bubble {
             border-radius: 16px;
-            padding: 12px 14px;
-            line-height: 1.5;
-            font-size: 0.96rem;
+            padding: 11px 13px;
+            line-height: 1.55;
+            font-size: 0.94rem;
             box-shadow: 0 4px 12px rgba(34, 48, 70, 0.05);
             white-space: pre-wrap;
             word-wrap: break-word;
@@ -465,21 +598,32 @@ INDEX_HTML = """
             border-bottom-left-radius: 6px;
         }
 
+        .sentiment-chip {
+            display: inline-block;
+            margin-top: 8px;
+            padding: 5px 10px;
+            border-radius: 999px;
+            background: rgba(76, 143, 232, 0.12);
+            color: #24589d;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+
         .input-label {
             margin-bottom: 8px;
-            font-size: 0.96rem;
+            font-size: 0.92rem;
             font-weight: 600;
         }
 
         .chat-input-row {
             display: grid;
             grid-template-columns: 1fr auto;
-            gap: 12px;
+            gap: 10px;
             align-items: end;
         }
 
         .chat-input-row textarea {
-            min-height: 72px;
+            min-height: 64px;
             resize: vertical;
         }
 
@@ -488,11 +632,11 @@ INDEX_HTML = """
             border-radius: 14px;
             background: var(--primary);
             color: white;
-            font-size: 1rem;
+            font-size: 0.96rem;
             font-weight: 600;
-            padding: 14px 22px;
+            padding: 13px 22px;
             cursor: pointer;
-            min-width: 110px;
+            min-width: 100px;
             transition: background 0.2s ease, transform 0.15s ease;
         }
 
@@ -506,37 +650,67 @@ INDEX_HTML = """
 
         .validation-msg {
             margin-top: 8px;
-            font-size: 0.88rem;
+            font-size: 0.86rem;
             color: #b33a3a;
             min-height: 18px;
         }
 
         .dashboard-top-note {
-            font-size: 0.92rem;
+            font-size: 0.88rem;
             color: var(--text-muted);
+            margin-bottom: 10px;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
             margin-bottom: 12px;
+        }
+
+        .summary-card {
+            background: var(--summary-bg);
+            border: 1px solid rgba(120, 149, 178, 0.16);
+            border-radius: 16px;
+            padding: 12px;
+        }
+
+        .summary-label {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-bottom: 5px;
+        }
+
+        .summary-value {
+            font-size: 1.08rem;
+            font-weight: 700;
         }
 
         .chart-card {
             background: rgba(255, 255, 255, 0.55);
             border: 1px solid rgba(120, 149, 178, 0.16);
             border-radius: 18px;
-            padding: 14px;
-            margin-bottom: 16px;
+            padding: 12px;
+            margin-bottom: 12px;
         }
 
         .chart-title {
-            font-size: 1rem;
+            font-size: 0.95rem;
             font-weight: 700;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
+        }
+
+        .chart-card canvas {
+            width: 100% !important;
+            height: 170px !important;
         }
 
         .no-data-message {
             display: none;
-            font-size: 0.92rem;
+            font-size: 0.88rem;
             color: var(--text-muted);
-            margin-bottom: 14px;
-            padding: 10px 12px;
+            margin-bottom: 10px;
+            padding: 9px 11px;
             background: rgba(255, 255, 255, 0.55);
             border-radius: 12px;
         }
@@ -545,14 +719,23 @@ INDEX_HTML = """
             main {
                 grid-template-columns: 1fr;
             }
+
+            .dashboard-section {
+                order: 2;
+            }
+
+            .chat-section {
+                order: 1;
+            }
         }
 
         @media (max-width: 640px) {
             header h1 {
-                font-size: 2rem;
+                font-size: 1.8rem;
             }
 
-            .wellness-grid {
+            .wellness-grid,
+            .summary-grid {
                 grid-template-columns: 1fr;
             }
 
@@ -566,6 +749,10 @@ INDEX_HTML = """
 
             .message {
                 max-width: 100%;
+            }
+
+            .chart-card canvas {
+                height: 160px !important;
             }
         }
     </style>
@@ -620,7 +807,7 @@ INDEX_HTML = """
 
                 <div class="chat-header-row">
                     <h3>Chat Conversation</h3>
-                    <span class="chat-subtitle">Your messages and supportive responses will appear below.</span>
+                    <span class="chat-subtitle">Your messages and AI responses will appear below.</span>
                 </div>
 
                 <div class="chat-window" id="chatWindow">
@@ -644,6 +831,25 @@ INDEX_HTML = """
                 <p class="dashboard-top-note">
                     Your recent check-ins are shown below. If you have not added entries yet, sample trend data will be displayed.
                 </p>
+
+                <div class="summary-grid">
+                    <div class="summary-card">
+                        <div class="summary-label">Average Stress</div>
+                        <div class="summary-value" id="avgStress">0</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-label">Average Sleep</div>
+                        <div class="summary-value" id="avgSleep">0 hrs</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-label">Average Anxiety</div>
+                        <div class="summary-value" id="avgAnxiety">0</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-label">Most Common Mood</div>
+                        <div class="summary-value" id="commonMood">No data</div>
+                    </div>
+                </div>
 
                 <div class="no-data-message" id="noDataMessage">
                     No wellness data available yet. Showing sample trend data for layout preview.
@@ -682,6 +888,11 @@ INDEX_HTML = """
         const validationMsg = document.getElementById("validationMsg");
         const noDataMessage = document.getElementById("noDataMessage");
 
+        const avgStressEl = document.getElementById("avgStress");
+        const avgSleepEl = document.getElementById("avgSleep");
+        const avgAnxietyEl = document.getElementById("avgAnxiety");
+        const commonMoodEl = document.getElementById("commonMood");
+
         let stressChart = null;
         let sleepChart = null;
         let moodChart = null;
@@ -697,7 +908,7 @@ INDEX_HTML = """
             }
         }
 
-        function addMessage(sender, text, type = "bot", timestamp = null) {
+        function addMessage(sender, text, type = "bot", timestamp = null, detectedSentiment = null) {
             removeEmptyChatState();
 
             const wrapper = document.createElement("div");
@@ -713,6 +924,13 @@ INDEX_HTML = """
 
             wrapper.appendChild(meta);
             wrapper.appendChild(bubble);
+
+            if (detectedSentiment && type === "bot") {
+                const chip = document.createElement("div");
+                chip.classList.add("sentiment-chip");
+                chip.textContent = `Detected Sentiment: ${detectedSentiment}`;
+                wrapper.appendChild(chip);
+            }
 
             chatWindow.appendChild(wrapper);
             chatWindow.scrollTop = chatWindow.scrollHeight;
@@ -735,10 +953,10 @@ INDEX_HTML = """
 
         function getSampleEntries() {
             return [
-                { created_at: new Date(Date.now() - 4 * 86400000).toISOString(), stress_level: 6, sleep_hours: 6.5, mood: "stressed" },
-                { created_at: new Date(Date.now() - 3 * 86400000).toISOString(), stress_level: 5, sleep_hours: 7.0, mood: "neutral" },
-                { created_at: new Date(Date.now() - 2 * 86400000).toISOString(), stress_level: 7, sleep_hours: 5.5, mood: "anxious" },
-                { created_at: new Date(Date.now() - 1 * 86400000).toISOString(), stress_level: 4, sleep_hours: 7.5, mood: "happy" }
+                { created_at: new Date(Date.now() - 4 * 86400000).toISOString(), stress_level: 6, sleep_hours: 6.5, anxiety_level: 5, mood: "stressed" },
+                { created_at: new Date(Date.now() - 3 * 86400000).toISOString(), stress_level: 5, sleep_hours: 7.0, anxiety_level: 4, mood: "neutral" },
+                { created_at: new Date(Date.now() - 2 * 86400000).toISOString(), stress_level: 7, sleep_hours: 5.5, anxiety_level: 7, mood: "anxious" },
+                { created_at: new Date(Date.now() - 1 * 86400000).toISOString(), stress_level: 4, sleep_hours: 7.5, anxiety_level: 3, mood: "happy" }
             ];
         }
 
@@ -779,19 +997,14 @@ INDEX_HTML = """
                 }
 
                 if (data.is_crisis) {
-                    addMessage("Crisis Alert", data.message, "alert");
+                    addMessage("Crisis Alert", data.message, "alert", data.created_at);
                     if (data.resources) {
                         data.resources.forEach((resource) => {
-                            addMessage("Emergency Support", resource, "alert");
+                            addMessage("Emergency Support", resource, "alert", data.created_at);
                         });
                     }
                 } else {
-                    addMessage("Support Bot", data.acknowledgement, "bot", data.created_at);
-                    if (data.suggestions) {
-                        data.suggestions.forEach((suggestion) => {
-                            addMessage("Support Bot", suggestion, "bot", data.created_at);
-                        });
-                    }
+                    addMessage("AI Support Bot", data.grouped_message, "bot", data.created_at, data.detected_sentiment);
                 }
 
                 await loadDashboard();
@@ -820,27 +1033,53 @@ INDEX_HTML = """
                         backgroundColor: bgColor,
                         fill: true,
                         tension: 0.35,
-                        pointRadius: 4,
-                        pointHoverRadius: 5
+                        pointRadius: 3,
+                        pointHoverRadius: 4,
+                        borderWidth: 2
                     }]
                 },
                 options: {
                     responsive: true,
-                    maintainAspectRatio: true,
+                    maintainAspectRatio: false,
                     plugins: {
                         legend: {
-                            display: true
+                            display: true,
+                            labels: {
+                                boxWidth: 22,
+                                font: {
+                                    size: 10
+                                }
+                            }
                         }
                     },
                     scales: {
+                        x: {
+                            ticks: {
+                                font: {
+                                    size: 10
+                                }
+                            }
+                        },
                         y: {
                             beginAtZero: true,
                             min: minY,
-                            ...(maxY !== null ? { max: maxY } : {})
+                            ...(maxY !== null ? { max: maxY } : {}),
+                            ticks: {
+                                font: {
+                                    size: 10
+                                }
+                            }
                         }
                     }
                 }
             });
+        }
+
+        function updateWeeklySummary(summary) {
+            avgStressEl.textContent = summary.average_stress ?? 0;
+            avgSleepEl.textContent = `${summary.average_sleep ?? 0} hrs`;
+            avgAnxietyEl.textContent = summary.average_anxiety ?? 0;
+            commonMoodEl.textContent = summary.most_common_mood || "No data";
         }
 
         async function loadDashboard() {
@@ -851,15 +1090,33 @@ INDEX_HTML = """
                 const data = await res.json();
 
                 let entries = data.entries || [];
+                let weeklySummary = data.weekly_summary || {
+                    average_stress: 0,
+                    average_sleep: 0,
+                    average_anxiety: 0,
+                    most_common_mood: "No data",
+                    checkins: 0
+                };
+
                 let usingSampleData = false;
 
                 if (!entries.length) {
                     entries = getSampleEntries();
                     usingSampleData = true;
                     noDataMessage.style.display = "block";
+
+                    weeklySummary = {
+                        average_stress: 5.5,
+                        average_sleep: 6.6,
+                        average_anxiety: 4.8,
+                        most_common_mood: "Neutral",
+                        checkins: 4
+                    };
                 } else {
                     noDataMessage.style.display = "none";
                 }
+
+                updateWeeklySummary(weeklySummary);
 
                 const labels = entries.map((entry) =>
                     new Date(entry.created_at).toLocaleDateString([], {
@@ -935,9 +1192,6 @@ INDEX_HTML = """
 def index():
     return render_template_string(INDEX_HTML)
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
