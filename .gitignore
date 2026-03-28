@@ -1,9 +1,21 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Python cache (optional since you have python files)
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Virtual environment
 venv/
-.env
-instance/
+
+# Database files
 *.sqlite3
 *.db
+
+# Misc
+instance/
