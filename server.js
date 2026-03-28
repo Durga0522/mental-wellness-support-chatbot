@@ -11,11 +11,15 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 
+// Neon / PostgreSQL connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
+// Create tables if they do not exist
 const createTables = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -40,21 +44,25 @@ const createTables = async () => {
   `);
 };
 
-const generateToken = (user) =>
-  jwt.sign(
+const generateToken = (user) => {
+  return jwt.sign(
     { id: user.id, email: user.email, role: user.role },
     process.env.JWT_SECRET || "mysecretkey",
     { expiresIn: "1d" }
   );
+};
 
 const authMiddleware = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
+
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({ message: "Access denied. No token provided." });
     }
+
     const token = authHeader.split(" ")[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET || "mysecretkey");
+
     req.user = decoded;
     next();
   } catch (error) {
@@ -71,6 +79,7 @@ const roleMiddleware = (...allowedRoles) => {
   };
 };
 
+// Root route
 app.get("/", (req, res) => {
   res.json({ message: "Inventory Management API is running successfully" });
 });
@@ -81,10 +90,22 @@ app.post("/api/auth/register", async (req, res) => {
     const { name, email, password, role } = req.body;
 
     if (!name || !email || !password) {
-      return res.status(400).json({ message: "Name, email, and password are required" });
+      return res.status(400).json({
+        message: "Name, email, and password are required",
+      });
     }
 
-    const existingUser = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (password.length < 6) {
+      return res.status(400).json({
+        message: "Password must be at least 6 characters long",
+      });
+    }
+
+    const existingUser = await pool.query(
+      "SELECT * FROM users WHERE email = $1",
+      [email]
+    );
+
     if (existingUser.rows.length > 0) {
       return res.status(400).json({ message: "User already exists" });
     }
@@ -113,7 +134,17 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const userResult = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (!email || !password) {
+      return res.status(400).json({
+        message: "Email and password are required",
+      });
+    }
+
+    const userResult = await pool.query(
+      "SELECT * FROM users WHERE email = $1",
+      [email]
+    );
+
     if (userResult.rows.length === 0) {
       return res.status(400).json({ message: "Invalid email or password" });
     }
@@ -181,13 +212,36 @@ app.get("/api/items", authMiddleware, async (req, res) => {
   }
 });
 
-// Create item
+// Get single item
+app.get("/api/items/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const itemResult = await pool.query(
+      "SELECT * FROM items WHERE id = $1",
+      [id]
+    );
+
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ message: "Item not found" });
+    }
+
+    res.status(200).json(itemResult.rows[0]);
+  } catch (error) {
+    console.error("Get item error:", error.message);
+    res.status(500).json({ message: "Server error while fetching item" });
+  }
+});
+
+// Create item (Admin only)
 app.post("/api/items", authMiddleware, roleMiddleware("admin"), async (req, res) => {
   try {
     const { name, description, quantity, price } = req.body;
 
     if (!name || quantity === undefined || price === undefined) {
-      return res.status(400).json({ message: "Name, quantity, and price are required" });
+      return res.status(400).json({
+        message: "Name, quantity, and price are required",
+      });
     }
 
     const newItem = await pool.query(
@@ -204,6 +258,71 @@ app.post("/api/items", authMiddleware, roleMiddleware("admin"), async (req, res)
   } catch (error) {
     console.error("Create item error:", error.message);
     res.status(500).json({ message: "Server error while creating item" });
+  }
+});
+
+// Update item (Admin only)
+app.put("/api/items/:id", authMiddleware, roleMiddleware("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, quantity, price } = req.body;
+
+    const existingItem = await pool.query(
+      "SELECT * FROM items WHERE id = $1",
+      [id]
+    );
+
+    if (existingItem.rows.length === 0) {
+      return res.status(404).json({ message: "Item not found" });
+    }
+
+    const updatedItem = await pool.query(
+      `UPDATE items
+       SET name = $1,
+           description = $2,
+           quantity = $3,
+           price = $4
+       WHERE id = $5
+       RETURNING *`,
+      [
+        name ?? existingItem.rows[0].name,
+        description ?? existingItem.rows[0].description,
+        quantity ?? existingItem.rows[0].quantity,
+        price ?? existingItem.rows[0].price,
+        id,
+      ]
+    );
+
+    res.status(200).json({
+      message: "Item updated successfully",
+      item: updatedItem.rows[0],
+    });
+  } catch (error) {
+    console.error("Update item error:", error.message);
+    res.status(500).json({ message: "Server error while updating item" });
+  }
+});
+
+// Delete item (Admin only)
+app.delete("/api/items/:id", authMiddleware, roleMiddleware("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existingItem = await pool.query(
+      "SELECT * FROM items WHERE id = $1",
+      [id]
+    );
+
+    if (existingItem.rows.length === 0) {
+      return res.status(404).json({ message: "Item not found" });
+    }
+
+    await pool.query("DELETE FROM items WHERE id = $1", [id]);
+
+    res.status(200).json({ message: "Item deleted successfully" });
+  } catch (error) {
+    console.error("Delete item error:", error.message);
+    res.status(500).json({ message: "Server error while deleting item" });
   }
 });
 
